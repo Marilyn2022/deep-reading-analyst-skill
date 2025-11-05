@@ -1,1 +1,148 @@
+name: Auto-fork upstream on update
 
+on:
+  schedule:
+    # 每小时检查一次上游仓库（可根据需要修改）
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: '上游仓库（格式 owner/repo）。如果留空，将使用 DEFAULT_UPSTREAM。'
+        required: false
+        default: ''
+
+env:
+  # 请把下面的默认上游仓库替换为你想要监控的仓库（owner/repo）
+  DEFAULT_UPSTREAM: 'OWNER/REPO'
+  # 将用于保存上次检测到的 commit SHA 的文件路径
+  SHA_FILE: '.github/last_upstream_sha'
+  # 如果希望在发现已有 fork 时先删除再重新 fork，把这个改为 'true'（注意需要 delete_repo 权限）
+  DELETE_EXISTING_FORK: 'false'
+
+jobs:
+  check-and-fork:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository (used to read/write SHA file)
+        uses: actions/checkout@v4
+        with:
+          # 使用 FORK_PAT 来 push 更新 SHA 文件（FORK_PAT 在仓库 Secrets 中配置）
+          token: ${{ secrets.FORK_PAT }}
+
+      - name: Ensure jq is available
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Determine upstream repo to check
+        id: pick
+        run: |
+          # workflow_dispatch 时可通过输入覆盖上游仓库
+          INPUT_UPSTREAM="${{ github.event.inputs.upstream }}"
+          if [ -z "$INPUT_UPSTREAM" ] || [ "$INPUT_UPSTREAM" = "null" ]; then
+            UPSTREAM="${{ env.DEFAULT_UPSTREAM }}"
+          else
+            UPSTREAM="$INPUT_UPSTREAM"
+          fi
+          echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
+
+      - name: Get latest commit SHA from upstream
+        id: getsha
+        run: |
+          UPSTREAM="${{ steps.pick.outputs.upstream }}"
+          echo "Checking upstream: $UPSTREAM"
+          # 使用公共 API 获取最近一次提交（主分支最近提交）；若上游私有需用合适 token
+          latest=$(curl -s -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$UPSTREAM/commits?per_page=1" | jq -r '.[0].sha // empty')
+          if [ -z "$latest" ]; then
+            echo "ERROR: 无法获取上游仓库最新提交 SHA。请确认仓库名正确且可访问。"
+            exit 1
+          fi
+          echo "latest_sha=$latest" >> $GITHUB_OUTPUT
+
+      - name: Read previously recorded upstream SHA (if any)
+        id: readprev
+        run: |
+          SHA_FILE="${{ env.SHA_FILE }}"
+          if [ -f "$SHA_FILE" ]; then
+            prev=$(cat "$SHA_FILE" | tr -d '\n')
+            echo "prev_sha=$prev" >> $GITHUB_OUTPUT
+          else
+            echo "prev_sha=" >> $GITHUB_OUTPUT
+
+      - name: Compare SHAs and decide
+        id: decide
+        run: |
+          latest="${{ steps.getsha.outputs.latest_sha }}"
+          prev="${{ steps.readprev.outputs.prev_sha }}"
+          echo "latest=$latest"
+          echo "prev=$prev"
+          if [ "$latest" = "$prev" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit if no change
+        if: steps.decide.outputs.changed == 'false'
+        run: |
+          echo "上游仓库未发生变化，退出工作流。"
+
+      - name: Prepare variables for fork
+        if: steps.decide.outputs.changed == 'true'
+        id: vars
+        run: |
+          UPSTREAM="${{ steps.pick.outputs.upstream }}"
+          # 解析上游的 owner 和 repo 名称
+          owner=$(echo "$UPSTREAM" | cut -d'/' -f1)
+          repo=$(echo "$UPSTREAM" | cut -d'/' -f2)
+          # 本仓库所有者（将作为 fork 的接收者）
+          FORK_OWNER="${{ github.repository_owner }}"
+          echo "owner=$owner" >> $GITHUB_OUTPUT
+          echo "repo=$repo" >> $GITHUB_OUTPUT
+          echo "fork_owner=$FORK_OWNER" >> $GITHUB_OUTPUT
+          echo "latest_sha=${{ steps.getsha.outputs.latest_sha }}" >> $GITHUB_OUTPUT
+
+      - name: Optionally delete existing fork (dangerous — needs delete_repo scope)
+        if: steps.decide.outputs.changed == 'true' && env.DELETE_EXISTING_FORK == 'true'
+        env:
+          FORK_PAT: ${{ secrets.FORK_PAT }}
+        run: |
+          fork_owner="${{ steps.vars.outputs.fork_owner }}"
+          repo="${{ steps.vars.outputs.repo }}"
+          echo "Deleting existing fork ${fork_owner}/${repo} if it exists..."
+          resp=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: token ${FORK_PAT}" "https://api.github.com/repos/${fork_owner}/${repo}")
+          if [ "$resp" = "204" ]; then
+            echo "Deleted existing fork."
+          else
+            echo "Delete returned HTTP $resp (it may not exist or permission missing). Continuing."
+          fi
+
+      - name: Create fork of upstream
+        if: steps.decide.outputs.changed == 'true'
+        env:
+          FORK_PAT: ${{ secrets.FORK_PAT }}
+        run: |
+          UPSTREAM="${{ steps.pick.outputs.upstream }}"
+          echo "Forking $UPSTREAM into your account..."
+          # 创建 fork（如已存在会返回 202/422 等）
+          resp=$(curl -s -H "Authorization: token ${FORK_PAT}" -H "Accept: application/vnd.github+json" -X POST "https://api.github.com/repos/${UPSTREAM}/forks")
+          echo "API response: $resp"
+          # 说明：若需要等待 fork 完成，可以增加轮询 GET /repos/owner/repo
+
+      - name: Update recorded upstream SHA and push
+        if: steps.decide.outputs.changed == 'true'
+        env:
+          FORK_PAT: ${{ secrets.FORK_PAT }}
+        run: |
+          SHA_FILE="${{ env.SHA_FILE }}"
+          latest="${{ steps.vars.outputs.latest_sha }}"
+          mkdir -p "$(dirname "$SHA_FILE")"
+          echo "$latest" > "$SHA_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$SHA_FILE"
+          git commit -m "chore: update last upstream sha to $latest" || echo "no changes to commit"
+          # push using FORK_PAT (actions/checkout 已用该 token 做了初始化)
+          git push origin HEAD:${{ github.ref_name || 'main' }} || git push
+
+      - name: Done
+        if: steps.decide.outputs.changed == 'true'
+        run: echo "已检测到上游更新并触发 fork 请求。"
